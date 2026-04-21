@@ -1,0 +1,269 @@
+"""
+训练脚本
+========
+python train.py                  # 复现 (论文原方法)
+python train.py --innovations    # 创新 (三图+对齐+任务感知融合)
+"""
+import os, argparse, json
+from collections import defaultdict
+import warnings; warnings.filterwarnings("ignore")
+os.environ["TRANSFORMERS_NO_ADVISORY_WARNINGS"] = "1"
+import torch, torch.optim as optim
+from torch.utils.data import DataLoader
+from torch.cuda.amp import autocast, GradScaler
+from sklearn.metrics import precision_recall_fscore_support, classification_report
+from tqdm import tqdm
+from config import Config
+from dataset import FUNSDDataset, collate_fn
+from model import DocumentIEModel
+from losses import compute_total_loss
+
+
+def evaluate(model, loader, config, device, desc="Val",
+             find_best_threshold=False, verbose=False, log_attn=False):
+    model.eval()
+    all_rp, all_rl, all_sp, all_sl, all_sc = [], [], [], [], []
+    attn_by_class = {0: [], 1: [], 2: [], 3: []}
+
+    with torch.no_grad():
+        for s in tqdm(loader, desc=desc, leave=False):
+            fields, kv_pairs = s["fields"], s["kv_pairs"]
+            sl = s.get("ser_labels"); N = len(fields)
+            if N < 2: continue
+            kv_set = set(tuple(p) for p in kv_pairs)
+            out = model(s["image"], fields, device, kv_set=kv_set)
+            if out is None: continue
+
+            if sl:
+                all_sp.extend(out["ser_logits"].argmax(-1).cpu().tolist())
+                all_sl.extend(sl)
+
+            # 记录 SER 注意力权重 (创新模式)
+            if log_attn and "ser_attn" in out and sl:
+                g = out["ser_attn"].cpu()
+                for i, lab in enumerate(sl):
+                    attn_by_class[lab].append(g[i].tolist())
+
+            ei = out["edge_index"]
+            if ei.size(1) == 0: continue
+            pairs = ei.t()
+            sij, _ = model.predict_pairs(out, pairs)
+            sig = torch.sigmoid(sij)
+            if len(all_rp) == 0:
+                print(f"  [Debug] edges={ei.size(1)} "
+                      f"sig mean={sig.mean():.3f} max={sig.max():.3f}")
+            for k in range(pairs.size(0)):
+                i, j = pairs[k].tolist()
+                lab = 1 if (i, j) in kv_set else 0
+                all_rl.append(lab)
+                all_rp.append(1 if sig[k].item() > config.re_threshold else 0)
+                if find_best_threshold:
+                    all_sc.append({"sig": sig[k].item(), "label": lab})
+
+    result = {}
+    if all_sl:
+        _, _, sf, _ = precision_recall_fscore_support(
+            all_sl, all_sp, average="macro", zero_division=0)
+        _, _, swf, _ = precision_recall_fscore_support(
+            all_sl, all_sp, average="weighted", zero_division=0)
+        result["ser_f1"] = float(sf)
+        result["ser_f1_w"] = float(swf)
+        if verbose:
+            print(classification_report(
+                all_sl, all_sp, labels=[0,1,2,3],
+                target_names=["question","answer","header","other"],
+                zero_division=0, digits=4))
+    else:
+        result["ser_f1"] = result["ser_f1_w"] = 0.
+
+    if all_rl:
+        rp, rr, rf, _ = precision_recall_fscore_support(
+            all_rl, all_rp, average="binary", zero_division=0)
+        result.update({"re_p": float(rp), "re_r": float(rr),
+                       "re_f1": float(rf)})
+    else:
+        result.update({"re_p": 0., "re_r": 0., "re_f1": 0.})
+
+    if find_best_threshold and all_sc:
+        bt, bf = 0.5, 0.
+        for t in [.3,.35,.4,.45,.5,.55,.6,.65,.7,.75,.8]:
+            p = [1 if x["sig"] > t else 0 for x in all_sc]
+            l = [x["label"] for x in all_sc]
+            _, _, f1, _ = precision_recall_fscore_support(
+                l, p, average="binary", zero_division=0)
+            if f1 > bf: bf, bt = f1, t
+        result["best_t"] = bt; result["best_f1"] = bf
+        print(f"    [Threshold] best_t={bt:.3f} F1={bf:.4f}")
+
+    if log_attn and any(len(v) for v in attn_by_class.values()):
+        import numpy as np
+        names = ["question", "answer", "header", "other"]
+        print(f"    [SER模态注意力] (α_text, α_vis, α_geo):")
+        for c in range(4):
+            if attn_by_class[c]:
+                m = np.mean(attn_by_class[c], axis=0)
+                print(f"      {names[c]:10s}: "
+                      f"text={m[0]:.3f} vis={m[1]:.3f} geo={m[2]:.3f}  "
+                      f"(n={len(attn_by_class[c])})")
+    return result
+
+
+def train(config):
+    config.make_dirs()
+    device = torch.device(config.device)
+    use_amp = config.use_amp and device.type == "cuda"
+    print(f"[Train] device={device}  AMP={'ON' if use_amp else 'OFF'}")
+
+    train_ds = FUNSDDataset(config.data_dir, split="train")
+    test_ds  = FUNSDDataset(config.data_dir, split="test")
+    train_dl = DataLoader(train_ds, batch_size=1, shuffle=True,
+                          collate_fn=collate_fn, num_workers=0)
+    test_dl  = DataLoader(test_ds, batch_size=1, shuffle=False,
+                          collate_fn=collate_fn, num_workers=0)
+
+    model = DocumentIEModel(config).to(device)
+    lm_p   = list(model.lm.parameters())
+    head_p = [p for n, p in model.named_parameters()
+              if not n.startswith("lm.")]
+    optimizer = optim.AdamW(
+        [{"params": lm_p, "lr": config.lr_encoder},
+         {"params": head_p, "lr": config.lr_head}],
+        weight_decay=config.weight_decay)
+    non_lm = sum(p.numel() for n, p in model.named_parameters()
+                 if not n.startswith("lm."))
+    print(f"[Model] Non-LM params: {non_lm/1e6:.2f}M")
+
+    total_steps = len(train_dl) * config.num_epochs
+    scheduler = optim.lr_scheduler.OneCycleLR(
+        optimizer, max_lr=[config.lr_encoder, config.lr_head],
+        total_steps=total_steps, pct_start=config.warmup_ratio)
+    scaler = GradScaler(enabled=use_amp)
+    ser_cw = torch.tensor(config.ser_class_weights,
+                          dtype=torch.float32, device=device)
+    best_f1, best_sf = 0., 0.
+    history = defaultdict(list)
+    mode = "创新(三图+对齐+任务感知)" if config.use_innovations else "复现"
+
+    print(f"\n{'='*70}")
+    print(f"  SEG-Doc {mode}  |  {config.num_epochs} epochs")
+    if config.use_innovations:
+        print(f"  三图: THGC + Visual-KNN(k={config.vis_knn_k})"
+              f" + Spatial-KNN(k={config.spa_knn_k})")
+        print(f"  模态GNN×{config.modal_gnn_layers} → 对齐(dim={config.align_dim})"
+              f" → 任务感知融合")
+        print(f"  λ_align={config.lambda_align}")
+    else:
+        print(f"  THGC + LAM-GraphSAGE ×{config.num_gnn_layers}")
+    print(f"  ★ RE trained on GRAPH EDGES")
+    print(f"{'='*70}")
+
+    for epoch in range(1, config.num_epochs + 1):
+        model.set_encoder_grad(epoch > config.freeze_encoder_epochs)
+        model.train()
+        eloss = defaultdict(float); nd = 0
+
+        for s in tqdm(train_dl,
+                      desc=f"Epoch {epoch:3d}/{config.num_epochs}",
+                      leave=False):
+            fields, kv_pairs = s["fields"], s["kv_pairs"]
+            sl = s.get("ser_labels"); N = len(fields)
+            if N < 2 or not kv_pairs:
+                continue
+            kv_set = set(tuple(p) for p in kv_pairs)
+
+            with autocast(enabled=use_amp):
+                out = model(s["image"], fields, device, kv_set=kv_set)
+                if out is None: continue
+                ei = out["edge_index"]
+                if ei.size(1) == 0: continue
+                pairs = ei.t()
+                sij, sji = model.predict_pairs(out, pairs)
+                slt = (torch.tensor(sl, dtype=torch.long, device=device)
+                       if sl else None)
+                ld = compute_total_loss(
+                    sij, sji,
+                    out["edge_labels_ij"], out["edge_labels_ji"],
+                    config, out["ser_logits"], slt, ser_cw,
+                    alignment_module=(model.alignment
+                                      if config.use_innovations else None),
+                    h_t=out.get("h_t"), h_v=out.get("h_v"),
+                    h_g=out.get("h_g"))
+                loss = ld["total"]
+
+            optimizer.zero_grad()
+            scaler.scale(loss).backward()
+            scaler.unscale_(optimizer)
+            torch.nn.utils.clip_grad_norm_(model.parameters(), config.grad_clip)
+            scaler.step(optimizer); scaler.update(); scheduler.step()
+
+            for k, v in ld.items():
+                if k != "total":
+                    eloss[k] += (v if isinstance(v, float) else v.item())
+            eloss["total"] += loss.item(); nd += 1
+
+        if nd == 0: continue
+        avg = {k: v/nd for k, v in eloss.items()}
+        align_str = (f"  align {avg.get('align',0):.4f}"
+                     if config.use_innovations else "")
+        print(f"\nEpoch {epoch:3d}/{config.num_epochs} | "
+              f"Loss {avg['total']:.4f}  "
+              f"[RE {avg['re']:.4f}  SER {avg.get('ser',0):.4f}"
+              f"{align_str}]")
+        for k, v in avg.items():
+            history[f"train_{k}"].append(v)
+
+        if epoch % config.eval_every == 0:
+            dbg = (epoch % config.debug_every == 0)
+            m = evaluate(model, test_dl, config, device,
+                         find_best_threshold=dbg, verbose=dbg,
+                         log_attn=(dbg and config.use_innovations))
+            print(f"         Val SER |  macro={m['ser_f1']:.4f}  "
+                  f"weighted={m['ser_f1_w']:.4f}")
+            print(f"         Val RE  |  P {m['re_p']:.4f}  "
+                  f"R {m['re_r']:.4f}  F1 {m['re_f1']:.4f}")
+            if dbg and "best_t" in m:
+                print(f"         (optimal t={m['best_t']:.3f}  "
+                      f"→ F1={m['best_f1']:.4f})")
+            for k, v in m.items():
+                if isinstance(v, float):
+                    history[f"val_{k}"].append(v)
+            rf, sf = m["re_f1"], m["ser_f1"]
+            if rf > best_f1 or (rf == best_f1 and sf > best_sf):
+                best_f1, best_sf = rf, sf
+                torch.save({"epoch": epoch,
+                             "state_dict": model.state_dict(),
+                             "re_f1": rf, "ser_f1": sf,
+                             "config": config}, config.best_ckpt)
+                print(f"         ✓ Best (RE={rf:.4f}, SER={sf:.4f})")
+
+    # Final evaluation with threshold search
+    print(f"\n[Final threshold search]")
+    ckpt = torch.load(config.best_ckpt, map_location=device)
+    model.load_state_dict(ckpt["state_dict"])
+    final = evaluate(model, test_dl, config, device,
+                     find_best_threshold=True, verbose=True,
+                     log_attn=config.use_innovations)
+    if "best_t" in final:
+        ckpt["threshold"] = final["best_t"]
+        torch.save(ckpt, config.best_ckpt)
+
+    print(f"\n{'='*70}")
+    print(f"  {mode} done.  Best RE={best_f1:.4f}  SER={best_sf:.4f}")
+    print(f"{'='*70}\n")
+    with open(os.path.join(config.output_dir, "history.json"), "w") as f:
+        json.dump(history, f, indent=2)
+
+
+if __name__ == "__main__":
+    pa = argparse.ArgumentParser()
+    pa.add_argument("--data_dir", default="./data/funsd")
+    pa.add_argument("--epochs", type=int, default=200)
+    pa.add_argument("--device", default=None)
+    pa.add_argument("--innovations", action="store_true")
+    a = pa.parse_args()
+    cfg = Config()
+    cfg.data_dir = a.data_dir
+    cfg.num_epochs = a.epochs
+    cfg.use_innovations = a.innovations
+    if a.device: cfg.device = a.device
+    train(cfg)
