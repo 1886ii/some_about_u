@@ -1,0 +1,49 @@
+"""FUNSD Dataset Loader"""
+import os, json
+from PIL import Image
+from torch.utils.data import Dataset
+from config import SER_LABEL_MAP
+
+class FUNSDDataset(Dataset):
+    def __init__(self, data_dir, split="train"):
+        assert split in ("train", "test")
+        d = "training_data" if split == "train" else "testing_data"
+        self.ann_dir = os.path.join(data_dir, d, "annotations")
+        self.img_dir = os.path.join(data_dir, d, "images")
+        self.files = sorted(f[:-5] for f in os.listdir(self.ann_dir) if f.endswith(".json"))
+        print(f"[FUNSD] {split}: {len(self.files)} docs")
+
+    def __len__(self): return len(self.files)
+
+    def __getitem__(self, idx):
+        name = self.files[idx]
+        with open(os.path.join(self.ann_dir, name + ".json"), encoding="utf-8") as f:
+            data = json.load(f)
+        image = Image.open(os.path.join(self.img_dir, name + ".png")).convert("RGB")
+        W, H = image.size
+        forms = data["form"]
+        id2idx = {fm["id"]: i for i, fm in enumerate(forms)}
+        fields, ser_labels = [], []
+        for fm in forms:
+            label = fm.get("label", "other").lower()
+            ser_labels.append(SER_LABEL_MAP.get(label, 3))
+            box = fm["box"]
+            nb = [int(box[0]*1000/W), int(box[1]*1000/H),
+                  int(box[2]*1000/W), int(box[3]*1000/H)]
+            words, wboxes = [], []
+            for w in fm.get("words", []):
+                words.append(w["text"])
+                wb = w["box"]
+                wboxes.append([int(wb[0]*1000/W), int(wb[1]*1000/H),
+                               int(wb[2]*1000/W), int(wb[3]*1000/H)])
+            if not words: words, wboxes = [fm.get("text","")], [nb]
+            fields.append({"text": fm.get("text",""), "box": nb, "abs_box": box,
+                           "words": words, "word_boxes": wboxes, "label": label})
+        kv_pairs = list(set(
+            (id2idx[s], id2idx[d]) for fm in forms
+            for s, d in fm.get("linking", [])
+            if s in id2idx and d in id2idx))
+        return {"fields": fields, "kv_pairs": kv_pairs,
+                "image": image, "ser_labels": ser_labels, "name": name}
+
+def collate_fn(batch): return batch[0]
