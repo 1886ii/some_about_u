@@ -1,0 +1,47 @@
+"""
+Losses
+=======
+复现: CE for SER + BCE for RE (论文原方法)
+创新: + 跨模态对齐损失 L_align
+"""
+import torch
+import torch.nn.functional as F
+
+
+def ser_loss(logits, labels, class_weights=None):
+    if class_weights is not None:
+        class_weights = class_weights.to(logits.device)
+    return F.cross_entropy(logits, labels, weight=class_weights)
+
+
+def re_loss(s_ij, s_ji, l_ij, l_ji):
+    return (F.binary_cross_entropy_with_logits(s_ij, l_ij.float()) +
+            F.binary_cross_entropy_with_logits(s_ji, l_ji.float())) / 2
+
+
+def compute_total_loss(s_ij, s_ji, l_ij, l_ji, config,
+                       ser_logits=None, ser_labels=None, ser_cw=None,
+                       alignment_module=None, h_t=None, h_v=None, h_g=None):
+    L_re = re_loss(s_ij, s_ji, l_ij, l_ji)
+    total = config.lambda_re * L_re
+    result = {"re": L_re.item()}
+
+    if ser_logits is not None and ser_labels is not None:
+        L_ser = ser_loss(ser_logits, ser_labels, ser_cw)
+        total = total + config.lambda_ser * L_ser
+        result["ser"] = L_ser.item()
+    else:
+        result["ser"] = 0.
+
+    # 创新模式: 跨模态对齐损失
+    if (config.use_innovations and alignment_module is not None
+            and h_t is not None):
+        a_t, a_v, a_g = alignment_module(h_t, h_v, h_g)
+        L_align = alignment_module.alignment_loss(a_t, a_v, a_g)
+        total = total + config.lambda_align * L_align
+        result["align"] = L_align.item()
+    else:
+        result["align"] = 0.
+
+    result["total"] = total
+    return result
