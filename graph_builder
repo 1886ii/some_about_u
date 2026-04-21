@@ -1,0 +1,221 @@
+"""
+Graph Builder
+==============
+复现模式: 只建 THGC 图 (论文 Algorithm 1)
+创新模式: 三个模态各建一个图
+  - 文本图 G_t: THGC (基于文本直方图余弦距离)
+  - 视觉图 G_v: KNN (基于视觉特征余弦相似度, 加空间距离约束)
+  - 空间图 G_s: KNN (基于曼哈顿距离)
+"""
+import math, torch
+import torch.nn.functional as F
+
+
+class GraphBuilder:
+    def __init__(self, config):
+        self.threshold = config.thgc_threshold
+        self.angle_tol = config.thgc_angle_tol
+        self.innovate  = config.use_innovations
+        self.vis_k     = config.vis_knn_k
+        self.spa_k     = config.spa_knn_k
+
+    # ────────────── THGC 辅助函数 ──────────────
+
+    @staticmethod
+    def _hist(text):
+        """论文 Eq.2: 文本直方图 [literals/total, numbers/total, others/total, 0]"""
+        if not text or not text.strip():
+            return [0., 0., 0., 1.]
+        n = len(text)
+        a = sum(1 for c in text if c.isalpha())
+        d = sum(1 for c in text if c.isdigit())
+        return [a/n, d/n, (n-a-d)/n, 0.]
+
+    @staticmethod
+    def _angle(bi, bj):
+        """论文 Eq.1: 用左上/右下/中心三组坐标算角度, 取最接近0°或90°的"""
+        coords = [(bi[0],bi[1],bj[0],bj[1]),
+                   (bi[2],bi[3],bj[2],bj[3]),
+                   ((bi[0]+bi[2])/2,(bi[1]+bi[3])/2,
+                    (bj[0]+bj[2])/2,(bj[1]+bj[3])/2)]
+        best_a, best_d = 0., float('inf')
+        for xi,yi,xj,yj in coords:
+            dx, dy = xj-xi, yj-yi
+            if abs(dx) < 1e-6 and abs(dy) < 1e-6:
+                continue
+            a = (math.atan2(dy, dx) * 180 / math.pi + 360) % 360
+            d = min(a % 90, 90 - a % 90)
+            if d < best_d:
+                best_d, best_a = d, a
+        return best_a
+
+    @staticmethod
+    def _angular_dist(bi, bj):
+        """论文 Eq.12: Angular_dist = Manhattan / cos(2*angle)"""
+        m = abs(bj[0]-bi[0]) + abs(bj[1]-bi[1])
+        if m < 1e-6:
+            return 0.
+        dx, dy = bj[0]-bi[0], bj[1]-bi[1]
+        a = (math.atan2(dy, dx) * 180 / math.pi + 360) % 360
+        c = math.cos(math.radians(2 * a))
+        return abs(m / c) if abs(c) > 1e-6 else m * 100
+
+    @staticmethod
+    def _cos_dist(h1, h2):
+        """论文 Eq.3: 1 - cos(hist_i, hist_j)"""
+        dot = sum(a*b for a, b in zip(h1, h2))
+        n1 = math.sqrt(sum(a*a for a in h1)) + 1e-8
+        n2 = math.sqrt(sum(a*a for a in h2)) + 1e-8
+        return 1. - dot / (n1 * n2)
+
+    # ────────────── THGC 建图 (Algorithm 1) ──────────────
+
+    def _build_thgc(self, fields, boxes):
+        N = len(fields)
+        hists = [self._hist(f.get("text", "")) for f in fields]
+        edges = set()
+        for i in range(N):
+            right, bottom = [], []
+            for j in range(N):
+                if i == j:
+                    continue
+                a = self._angle(boxes[i], boxes[j])
+                d = abs(boxes[j][0]-boxes[i][0]) + abs(boxes[j][1]-boxes[i][1])
+                if a <= self.angle_tol or a >= 360 - self.angle_tol:
+                    right.append((d, j))
+                if 90 - self.angle_tol <= a <= 90 + self.angle_tol:
+                    bottom.append((d, j))
+            right.sort()
+            bottom.sort()
+            has_neighbor = False
+            for _, j in right:
+                if self._cos_dist(hists[i], hists[j]) >= self.threshold:
+                    edges.add((i, j)); edges.add((j, i))
+                    has_neighbor = True
+                else:
+                    break
+            for _, j in bottom:
+                if self._cos_dist(hists[i], hists[j]) >= self.threshold:
+                    edges.add((i, j)); edges.add((j, i))
+                    has_neighbor = True
+                else:
+                    break
+            # 保证连通性: 孤立节点连最近的右/下邻居
+            if not has_neighbor:
+                if right:
+                    j = right[0][1]; edges.add((i, j)); edges.add((j, i))
+                if bottom:
+                    j = bottom[0][1]; edges.add((i, j)); edges.add((j, i))
+        return edges
+
+    # ────────────── 视觉 KNN 图 ──────────────
+
+    @staticmethod
+    def _build_visual_knn(vis_feat, k, boxes):
+        """基于视觉特征余弦相似度的 KNN, 加空间距离约束避免远处误连"""
+        N = vis_feat.size(0)
+        vn = F.normalize(vis_feat.detach(), dim=-1)
+        sim = torch.mm(vn, vn.t())
+        sim.fill_diagonal_(-1)
+        # 空间距离 mask: 只连归一化距离 < 0.3 的
+        cx = (boxes[:, 0] + boxes[:, 2]) / 2000
+        cy = (boxes[:, 1] + boxes[:, 3]) / 2000
+        d = ((cx.unsqueeze(1)-cx.unsqueeze(0))**2 +
+             (cy.unsqueeze(1)-cy.unsqueeze(0))**2).sqrt()
+        sim[d > 0.3] = -1
+        edges = set()
+        for i in range(N):
+            _, topk = sim[i].topk(min(k, N-1))
+            for j in topk.tolist():
+                if sim[i, j].item() > 0:
+                    edges.add((i, j)); edges.add((j, i))
+        return edges
+
+    # ────────────── 空间 KNN 图 ──────────────
+
+    @staticmethod
+    def _build_spatial_knn(boxes, k):
+        """基于曼哈顿距离的 KNN"""
+        N = boxes.size(0)
+        cx = (boxes[:, 0] + boxes[:, 2]) / 2
+        cy = (boxes[:, 1] + boxes[:, 3]) / 2
+        d = (cx.unsqueeze(1)-cx.unsqueeze(0)).abs() + \
+            (cy.unsqueeze(1)-cy.unsqueeze(0)).abs()
+        d.fill_diagonal_(float('inf'))
+        edges = set()
+        for i in range(N):
+            _, topk = d[i].topk(min(k, N-1), largest=False)
+            for j in topk.tolist():
+                edges.add((i, j)); edges.add((j, i))
+        return edges
+
+    # ────────────── 公共工具 ──────────────
+
+    @staticmethod
+    def _edges_to_tensor(edges, device):
+        if not edges:
+            return torch.zeros(2, 0, dtype=torch.long, device=device)
+        return torch.tensor(sorted(edges), dtype=torch.long,
+                            device=device).t().contiguous()
+
+    def _compute_ang_and_labels(self, ei, boxes_list, device, kv_set):
+        """对 THGC 的边计算 angular_dist 和 RE label"""
+        z = torch.zeros(0, device=device)
+        if ei.size(1) == 0:
+            return z, z, z
+        sl, dl = ei[0].tolist(), ei[1].tolist()
+        ang = torch.tensor(
+            [self._angular_dist(boxes_list[s], boxes_list[d])
+             for s, d in zip(sl, dl)],
+            dtype=torch.float32, device=device)
+        if kv_set:
+            lij = torch.tensor(
+                [1. if (s, d) in kv_set else 0. for s, d in zip(sl, dl)],
+                device=device)
+            lji = torch.tensor(
+                [1. if (d, s) in kv_set else 0. for s, d in zip(sl, dl)],
+                device=device)
+        else:
+            lij = torch.zeros(ei.size(1), device=device)
+            lji = torch.zeros(ei.size(1), device=device)
+        return ang, lij, lji
+
+    # ────────────── 主接口 ──────────────
+
+    def build(self, fields, boxes_norm, device, kv_set=None, vis_feat=None):
+        """
+        复现模式: 返回 (ei, ang, lij, lji)
+        创新模式: 返回 (ei_thgc, ang, lij, lji, ei_vis, ei_spa)
+        """
+        N = len(fields)
+        e0 = torch.zeros(2, 0, dtype=torch.long, device=device)
+        z0 = torch.zeros(0, device=device)
+
+        if N < 2:
+            if self.innovate:
+                return e0, z0, z0, z0, e0, e0
+            return e0, z0, z0, z0
+
+        bl = boxes_norm.cpu().tolist()
+
+        # THGC 图 (始终构建)
+        thgc_edges = self._build_thgc(fields, bl)
+        ei_thgc = self._edges_to_tensor(thgc_edges, device)
+        ang, lij, lji = self._compute_ang_and_labels(
+            ei_thgc, bl, device, kv_set)
+
+        if not self.innovate:
+            return ei_thgc, ang, lij, lji
+
+        # 视觉 KNN 图
+        if vis_feat is not None and vis_feat.size(0) == N:
+            vis_edges = self._build_visual_knn(vis_feat, self.vis_k, boxes_norm)
+            ei_vis = self._edges_to_tensor(vis_edges, device)
+        else:
+            ei_vis = e0
+
+        # 空间 KNN 图
+        spa_edges = self._build_spatial_knn(boxes_norm, self.spa_k)
+        ei_spa = self._edges_to_tensor(spa_edges, device)
+
+        return ei_thgc, ang, lij, lji, ei_vis, ei_spa
