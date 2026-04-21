@@ -1,0 +1,486 @@
+"""
+Model — SEG-Doc 复现 + 创新: 三图对齐 + 任务感知融合
+=====================================================
+
+复现模式 (use_innovations=False):
+  论文原方法: text+vis+geo → MLP各投影 → Concat → LAM-GraphSAGE×3 → SER/RE
+
+创新模式 (use_innovations=True):
+  ┌─────────────────────────────────────────────────────────────────┐
+  │ Phase 1: 模态编码 (与复现相同的编码器)                            │
+  │   text_f = TextProj(LayoutLMv3(words))   [N, modal_dim]        │
+  │   vis_f  = VisProj(ResNet18(crops))      [N, modal_dim]        │
+  │   geo_f  = GeoProj(box_coords)           [N, modal_dim]        │
+  │                                                                 │
+  │ Phase 2: 三图独立GNN                                            │
+  │   text_f → THGC图   → LAM-GraphSAGE×2 → h_t  [N, modal_dim]   │
+  │   vis_f  → 视觉KNN图 → GraphSAGE×2     → h_v  [N, modal_dim]   │
+  │   geo_f  → 空间KNN图 → GraphSAGE×2     → h_g  [N, modal_dim]   │
+  │                                                                 │
+  │ Phase 3: 跨模态对齐                                              │
+  │   将 h_t, h_v, h_g 投影到共享对齐空间 align_dim                    │
+  │   L_align = cosine alignment loss                               │
+  │   (同一个节点在不同模态图中的表示应该方向一致)                       │
+  │                                                                 │
+  │ Phase 4: 任务感知注意力融合                                       │
+  │   SER: 对每个节点, 学习三个模态的注意力权重 → 加权融合 → SER head   │
+  │   RE:  对每条边, 根据空间关系学习模态权重 → 加权融合 → RE head      │
+  │   (不同任务用不同的注意力参数, 让模型自己学哪个模态更重要)            │
+  └─────────────────────────────────────────────────────────────────┘
+"""
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+import torchvision.models as tv_models
+from torchvision import transforms
+from transformers import LayoutLMv3Model, LayoutLMv3Processor
+from config import Config
+from graph_builder import GraphBuilder
+
+
+# ═══════════════════════════════════════════════════════════════════
+# 编码器 (两种模式共用)
+# ═══════════════════════════════════════════════════════════════════
+
+class VisualEncoder(nn.Module):
+    """ResNet18 crop encoder → 视觉特征"""
+    _tf = transforms.Compose([
+        transforms.Resize((64, 64)), transforms.ToTensor(),
+        transforms.Normalize([.485,.456,.406], [.229,.224,.225])])
+
+    def __init__(self, d):
+        super().__init__()
+        r = tv_models.resnet18(weights=tv_models.ResNet18_Weights.IMAGENET1K_V1)
+        self.bb = nn.Sequential(*list(r.children())[:-2])
+        self.pool = nn.AdaptiveAvgPool2d(1)
+        self.proj = nn.Linear(512, d)
+
+    def forward(self, image, fields, device):
+        iw, ih = image.size
+        crops = []
+        for f in fields:
+            x0, y0, x1, y1 = [int(v) for v in f["abs_box"]]
+            x0, y0 = max(0, x0-2), max(0, y0-2)
+            x1, y1 = min(iw, x1+2), min(ih, y1+2)
+            if x1 - x0 < 4: x1 = x0 + 4
+            if y1 - y0 < 4: y1 = y0 + 4
+            crops.append(self._tf(image.crop((x0, y0, x1, y1))))
+        x = torch.stack(crops).to(device)
+        return self.proj(self.pool(self.bb(x)).flatten(1))
+
+
+# ═══════════════════════════════════════════════════════════════════
+# GNN 层
+# ═══════════════════════════════════════════════════════════════════
+
+class LAMGraphSAGELayer(nn.Module):
+    """论文 Eq.10-12: 带布局注意力的 GraphSAGE"""
+    def __init__(self, d, dropout=0.3):
+        super().__init__()
+        self.W = nn.Linear(d * 2, d)
+        self.norm = nn.LayerNorm(d)
+        self.drop = nn.Dropout(dropout)
+        self.scale = nn.Parameter(torch.tensor(100.))
+
+    def forward(self, x, ei, ang):
+        if ei.size(1) == 0:
+            return x
+        N = x.size(0)
+        src, dst = ei[0], ei[1]
+        w = torch.exp(-ang / self.scale.abs().clamp(min=1.))
+        ws = torch.zeros(N, device=x.device)
+        ws.scatter_add_(0, dst, w)
+        nw = w / ws[dst].clamp(min=1e-8)
+        msgs = x[src] * nw.unsqueeze(-1)
+        agg = torch.zeros_like(x)
+        agg.scatter_add_(0, dst.unsqueeze(-1).expand_as(msgs), msgs)
+        return self.drop(F.relu(self.norm(self.W(torch.cat([x, agg], -1)))))
+
+
+class MeanGraphSAGELayer(nn.Module):
+    """简单 Mean Aggregator GraphSAGE (无LAM, 用于视觉图/空间图)"""
+    def __init__(self, d, dropout=0.2):
+        super().__init__()
+        self.W = nn.Linear(d * 2, d)
+        self.norm = nn.LayerNorm(d)
+        self.drop = nn.Dropout(dropout)
+
+    def forward(self, x, ei):
+        if ei.size(1) == 0:
+            return x
+        N = x.size(0)
+        src, dst = ei[0], ei[1]
+        cnt = torch.zeros(N, device=x.device)
+        cnt.scatter_add_(0, dst, torch.ones(ei.size(1), device=x.device))
+        agg = torch.zeros_like(x)
+        agg.scatter_add_(0, dst.unsqueeze(-1).expand_as(x[src]), x[src])
+        agg = agg / cnt.clamp(min=1).unsqueeze(-1)
+        no_nb = (cnt == 0).unsqueeze(-1)
+        agg = torch.where(no_nb, x, agg)
+        return self.drop(F.relu(self.norm(self.W(torch.cat([x, agg], -1)))))
+
+
+# ═══════════════════════════════════════════════════════════════════
+# 创新模块 1: 跨模态对齐
+# ═══════════════════════════════════════════════════════════════════
+
+class CrossModalAlignment(nn.Module):
+    """
+    将三个模态GNN的输出投影到共享对齐空间.
+    对齐目标: 同一个节点在不同模态图中的表示方向应该一致.
+    """
+    def __init__(self, modal_dim, align_dim):
+        super().__init__()
+        self.proj_t = nn.Linear(modal_dim, align_dim)
+        self.proj_v = nn.Linear(modal_dim, align_dim)
+        self.proj_g = nn.Linear(modal_dim, align_dim)
+
+    def forward(self, h_t, h_v, h_g):
+        """
+        h_t, h_v, h_g: [N, modal_dim] — 三个模态GNN的输出
+        Returns:
+          a_t, a_v, a_g: [N, align_dim] — 对齐后的表示
+        """
+        a_t = self.proj_t(h_t)
+        a_v = self.proj_v(h_v)
+        a_g = self.proj_g(h_g)
+        return a_t, a_v, a_g
+
+    def alignment_loss(self, a_t, a_v, a_g):
+        """
+        余弦对齐损失: 同一节点的三个模态表示方向应该接近.
+        L = mean(1 - cos(a_t, a_v)) + mean(1 - cos(a_t, a_g))
+              + mean(1 - cos(a_v, a_g))
+        """
+        at = F.normalize(a_t, dim=-1)
+        av = F.normalize(a_v, dim=-1)
+        ag = F.normalize(a_g, dim=-1)
+        l_tv = (1 - (at * av).sum(-1)).mean()
+        l_tg = (1 - (at * ag).sum(-1)).mean()
+        l_vg = (1 - (av * ag).sum(-1)).mean()
+        return (l_tv + l_tg + l_vg) / 3
+
+
+# ═══════════════════════════════════════════════════════════════════
+# 创新模块 2: 任务感知注意力融合
+# ═══════════════════════════════════════════════════════════════════
+
+class TaskAwareFusion(nn.Module):
+    """
+    对齐后, SER和RE任务各自用不同的注意力参数融合三个模态.
+
+    SER (节点分类):
+      对每个节点 i, 根据对齐后的三个模态表示计算注意力权重,
+      加权融合得到 SER 专用表示.
+
+    RE (边分类):
+      对每条边 (i,j), 根据两端节点的对齐表示 + 空间特征
+      计算注意力权重, 加权融合得到 RE 专用的对表示.
+    """
+    def __init__(self, align_dim, ser_classes, spatial_dim=12, dropout=0.3):
+        super().__init__()
+        D = align_dim
+
+        # ── SER 路径: per-node 注意力 ──
+        self.ser_attn = nn.Sequential(
+            nn.Linear(D * 3, 64), nn.ReLU(), nn.Linear(64, 3))
+        self.ser_head = nn.Sequential(
+            nn.Linear(D * 3, D), nn.LayerNorm(D), nn.GELU(),
+            nn.Dropout(dropout), nn.Linear(D, ser_classes))
+
+        # ── RE 路径: per-edge 注意力 ──
+        self.re_attn = nn.Sequential(
+            nn.Linear(D * 6 + spatial_dim, 64), nn.ReLU(), nn.Linear(64, 3))
+        # 基础 RE head (从对齐表示)
+        in_re = D * 3 * 4 + spatial_dim  # concat(fi,fj,fi*fj,fi-fj,spatial)
+        self.re_kv = nn.Sequential(
+            nn.Linear(in_re, D), nn.ReLU(), nn.Dropout(dropout),
+            nn.Linear(D, 1))
+        self.re_vk = nn.Sequential(
+            nn.Linear(in_re, D), nn.ReLU(), nn.Dropout(dropout),
+            nn.Linear(D, 1))
+
+    @staticmethod
+    def _spatial_feat(bi, bj):
+        """12维空间特征 (与论文复现的REHead一致)"""
+        cxi, cyi = (bi[:,0]+bi[:,2])/2000, (bi[:,1]+bi[:,3])/2000
+        cxj, cyj = (bj[:,0]+bj[:,2])/2000, (bj[:,1]+bj[:,3])/2000
+        wi = (bi[:,2]-bi[:,0]).clamp(min=1)/1000
+        hi = (bi[:,3]-bi[:,1]).clamp(min=1)/1000
+        wj = (bj[:,2]-bj[:,0]).clamp(min=1)/1000
+        hj = (bj[:,3]-bj[:,1]).clamp(min=1)/1000
+        dx, dy = cxj - cxi, cyj - cyi
+        d = (dx**2 + dy**2).sqrt().clamp(min=1e-6)
+        ai, aj = wi*hi, wj*hj
+        ar = torch.min(ai, aj) / torch.max(ai, aj).clamp(min=1e-6)
+        yov = (torch.min(bi[:,3], bj[:,3]) -
+               torch.max(bi[:,1], bj[:,1])).clamp(min=0)
+        yov = yov / torch.max(bi[:,3]-bi[:,1],
+                               bj[:,3]-bj[:,1]).clamp(min=1) / 1000
+        return torch.stack([
+            dx, dy, d, dx/d, dy/d, wi, hi, wj, hj, ar, yov,
+            ((dy.abs() < 0.03) & (dx > 0.01)).float()], -1)
+
+    def forward_ser(self, a_t, a_v, a_g):
+        """
+        SER 任务感知融合.
+        a_t, a_v, a_g: [N, align_dim] — 对齐后的模态表示
+        Returns: ser_logits [N, C], attn_weights [N, 3]
+        """
+        # 拼接三个模态作为注意力输入
+        cat_all = torch.cat([a_t, a_v, a_g], -1)   # [N, 3*D]
+        attn = F.softmax(self.ser_attn(cat_all), dim=-1)  # [N, 3]
+
+        # 加权融合
+        fused = torch.cat([
+            attn[:, 0:1] * a_t,
+            attn[:, 1:2] * a_v,
+            attn[:, 2:3] * a_g], -1)                # [N, 3*D]
+
+        ser_logits = self.ser_head(fused)
+        return ser_logits, attn
+
+    def forward_re(self, a_t, a_v, a_g, pairs, boxes):
+        """
+        RE 任务感知融合.
+        pairs: [E, 2] 边的(src, dst)索引
+        boxes: [N, 4] 归一化坐标
+        Returns: score_kv [E], score_vk [E], attn_weights [E, 3]
+        """
+        ii, jj = pairs[:, 0], pairs[:, 1]
+        sp = self._spatial_feat(boxes[ii], boxes[jj])
+
+        # 注意力: 输入 = [src的三模态, dst的三模态, 空间特征]
+        attn_in = torch.cat([
+            a_t[ii], a_v[ii], a_g[ii],
+            a_t[jj], a_v[jj], a_g[jj], sp], -1)
+        attn = F.softmax(self.re_attn(attn_in), dim=-1)  # [E, 3]
+
+        # 加权融合 src 和 dst 的表示
+        fi = torch.cat([
+            attn[:, 0:1] * a_t[ii],
+            attn[:, 1:2] * a_v[ii],
+            attn[:, 2:3] * a_g[ii]], -1)              # [E, 3*D]
+        fj = torch.cat([
+            attn[:, 0:1] * a_t[jj],
+            attn[:, 1:2] * a_v[jj],
+            attn[:, 2:3] * a_g[jj]], -1)
+
+        sp_rev = self._spatial_feat(boxes[jj], boxes[ii])
+
+        feat_kv = torch.cat([fi, fj, fi*fj, fi-fj, sp], -1)
+        feat_vk = torch.cat([fj, fi, fj*fi, fj-fi, sp_rev], -1)
+
+        score_kv = self.re_kv(feat_kv).squeeze(-1)
+        score_vk = self.re_vk(feat_vk).squeeze(-1)
+        return score_kv, score_vk, attn
+
+
+# ═══════════════════════════════════════════════════════════════════
+# 复现模式的 RE Head
+# ═══════════════════════════════════════════════════════════════════
+
+class REHead(nn.Module):
+    """论文的边分类器 (复现模式用)"""
+    def __init__(self, d, spatial_dim=12, dropout=0.3):
+        super().__init__()
+        in_d = 4 * d + spatial_dim
+        self.kv = nn.Sequential(
+            nn.Linear(in_d, d), nn.ReLU(), nn.Dropout(dropout),
+            nn.Linear(d, 1))
+        self.vk = nn.Sequential(
+            nn.Linear(in_d, d), nn.ReLU(), nn.Dropout(dropout),
+            nn.Linear(d, 1))
+
+    def forward(self, h, pairs, boxes):
+        ii, jj = pairs[:, 0], pairs[:, 1]
+        sij = TaskAwareFusion._spatial_feat(boxes[ii], boxes[jj])
+        sji = TaskAwareFusion._spatial_feat(boxes[jj], boxes[ii])
+        hi, hj = h[ii], h[jj]
+        s_kv = self.kv(torch.cat([hi, hj, hi*hj, hi-hj, sij], -1)).squeeze(-1)
+        s_vk = self.vk(torch.cat([hj, hi, hj*hi, hj-hi, sji], -1)).squeeze(-1)
+        return s_kv, s_vk
+
+
+# ═══════════════════════════════════════════════════════════════════
+# 主模型
+# ═══════════════════════════════════════════════════════════════════
+
+class DocumentIEModel(nn.Module):
+    def __init__(self, config: Config):
+        super().__init__()
+        self.config = config
+        D = config.hidden_dim
+        md = config.modal_dim if config.use_innovations else D // 3
+
+        # ── 编码器 ───────────────────────────────────────────────
+        self.processor = LayoutLMv3Processor.from_pretrained(
+            config.encoder_name, apply_ocr=False)
+        self.lm = LayoutLMv3Model.from_pretrained(config.encoder_name)
+        lm_d = self.lm.config.hidden_size
+
+        self.text_proj = nn.Sequential(
+            nn.Linear(lm_d, md), nn.LayerNorm(md), nn.ReLU(),
+            nn.Dropout(config.gnn_dropout))
+        self.vis_encoder = VisualEncoder(md)
+        self.geo_proj = nn.Sequential(
+            nn.Linear(4, 64), nn.ReLU(), nn.Linear(64, md))
+
+        # ── 图构建器 ─────────────────────────────────────────────
+        self.graph_builder = GraphBuilder(config)
+
+        if config.use_innovations:
+            # ── 三个模态各自的 GNN ────────────────────────────────
+            self.gnn_text = nn.ModuleList([
+                LAMGraphSAGELayer(md, dropout=0.2)
+                for _ in range(config.modal_gnn_layers)])
+            self.gnn_vis = nn.ModuleList([
+                MeanGraphSAGELayer(md, dropout=0.2)
+                for _ in range(config.modal_gnn_layers)])
+            self.gnn_geo = nn.ModuleList([
+                MeanGraphSAGELayer(md, dropout=0.2)
+                for _ in range(config.modal_gnn_layers)])
+
+            # ── 跨模态对齐 ──────────────────────────────────────
+            self.alignment = CrossModalAlignment(md, config.align_dim)
+
+            # ── 任务感知融合 ────────────────────────────────────
+            self.task_fusion = TaskAwareFusion(
+                config.align_dim, config.ser_num_classes,
+                spatial_dim=12, dropout=config.gnn_dropout)
+        else:
+            # ── 复现模式: concat融合 + 共享GNN + 独立head ────────
+            self.fusion_lin = nn.Sequential(
+                nn.Linear(md * 3, D), nn.LayerNorm(D), nn.ReLU(),
+                nn.Dropout(config.gnn_dropout))
+            self.gnn = nn.ModuleList([
+                LAMGraphSAGELayer(D, config.gnn_dropout)
+                for _ in range(config.num_gnn_layers)])
+            self.ser_head = nn.Sequential(
+                nn.Linear(D, D), nn.GELU(), nn.Dropout(config.gnn_dropout),
+                nn.Linear(D, config.ser_num_classes))
+            self.re_head = REHead(D, spatial_dim=12, dropout=config.gnn_dropout)
+
+    def encode_text(self, image, fields, device):
+        all_w, all_b, w2f = [], [], []
+        for fi, f in enumerate(fields):
+            for w, b in zip(f["words"], f["word_boxes"]):
+                all_w.append(w); all_b.append(b); w2f.append(fi)
+        if not all_w:
+            all_w, all_b, w2f = ["[EMPTY]"], [[0,0,10,10]], [0]
+        enc = self.processor(
+            image, all_w, boxes=all_b, return_tensors="pt",
+            max_length=self.config.max_seq_len, truncation=True,
+            padding="max_length").to(device)
+        tok = self.lm(**enc).last_hidden_state[0]
+        wids = enc.word_ids(0)
+        N = len(fields)
+        feat = torch.zeros(N, tok.size(-1), device=device)
+        cnt = torch.zeros(N, device=device)
+        for pos, wid in enumerate(wids):
+            if wid is not None and wid < len(w2f):
+                feat[w2f[wid]] += tok[pos]
+                cnt[w2f[wid]] += 1
+        return feat / cnt.clamp(min=1).unsqueeze(-1)
+
+    def set_encoder_grad(self, rg):
+        for p in self.lm.parameters():
+            p.requires_grad_(rg)
+
+    def forward(self, image, fields, device, kv_set=None):
+        N = len(fields)
+        if N == 0:
+            return None
+        boxes = torch.tensor(
+            [f["box"] for f in fields], dtype=torch.float32, device=device)
+        geo = torch.stack([
+            boxes[:,0]/1000, boxes[:,1]/1000,
+            boxes[:,2]/1000, boxes[:,3]/1000], -1)
+
+        # ── Phase 1: 编码三个模态 ────────────────────────────────
+        text_f = self.text_proj(self.encode_text(image, fields, device))
+        vis_f  = self.vis_encoder(image, fields, device)
+        geo_f  = self.geo_proj(geo)
+
+        # ── 模态消融 mask ────────────────────────────────────────
+        if not self.config.use_text:   text_f = torch.zeros_like(text_f)
+        if not self.config.use_visual: vis_f  = torch.zeros_like(vis_f)
+        if not self.config.use_layout: geo_f  = torch.zeros_like(geo_f)
+
+        if self.config.use_innovations:
+            return self._forward_innovation(
+                text_f, vis_f, geo_f, fields, boxes, device, kv_set)
+        else:
+            return self._forward_reproduction(
+                text_f, vis_f, geo_f, fields, boxes, device, kv_set)
+
+    # ────────────── 复现模式 ──────────────
+
+    def _forward_reproduction(self, text_f, vis_f, geo_f,
+                               fields, boxes, device, kv_set):
+        h = self.fusion_lin(torch.cat([text_f, vis_f, geo_f], -1))
+        ei, ang, lij, lji = self.graph_builder.build(
+            fields, boxes, device, kv_set)
+        for layer in self.gnn:
+            h = layer(h, ei, ang)
+        ser_logits = self.ser_head(h)
+        return {
+            "h": h, "ser_logits": ser_logits, "boxes": boxes,
+            "edge_index": ei, "edge_labels_ij": lij, "edge_labels_ji": lji,
+            "mode": "reproduction"
+        }
+
+    # ────────────── 创新模式 ──────────────
+
+    def _forward_innovation(self, text_f, vis_f, geo_f,
+                             fields, boxes, device, kv_set):
+        # Phase 2: 三图各自的 GNN
+        ei_thgc, ang, lij, lji, ei_vis, ei_spa = \
+            self.graph_builder.build(
+                fields, boxes, device, kv_set, vis_feat=vis_f)
+
+        h_t = text_f
+        for layer in self.gnn_text:
+            h_t = layer(h_t, ei_thgc, ang)
+
+        h_v = vis_f
+        for layer in self.gnn_vis:
+            h_v = layer(h_v, ei_vis)
+
+        h_g = geo_f
+        for layer in self.gnn_geo:
+            h_g = layer(h_g, ei_spa)
+
+        # Phase 3: 跨模态对齐
+        a_t, a_v, a_g = self.alignment(h_t, h_v, h_g)
+
+        # Phase 4: SER 任务感知融合 (per-node)
+        ser_logits, ser_attn = self.task_fusion.forward_ser(a_t, a_v, a_g)
+
+        return {
+            "ser_logits": ser_logits, "boxes": boxes,
+            "edge_index": ei_thgc,
+            "edge_labels_ij": lij, "edge_labels_ji": lji,
+            # 对齐后的表示 (RE 在 predict_pairs 中用)
+            "a_t": a_t, "a_v": a_v, "a_g": a_g,
+            "ser_attn": ser_attn,       # [N, 3] for debug
+            "h_t": h_t, "h_v": h_v, "h_g": h_g,  # for alignment loss
+            "mode": "innovation"
+        }
+
+    # ────────────── RE 预测 ──────────────
+
+    def predict_pairs(self, out, pairs):
+        """
+        out:   forward() 的返回 dict
+        pairs: [E, 2] 边索引
+        Returns: (score_kv, score_vk)
+        """
+        if out["mode"] == "reproduction":
+            return self.re_head(out["h"], pairs, out["boxes"])
+        else:
+            # 创新模式: 任务感知 RE 融合
+            s_kv, s_vk, re_attn = self.task_fusion.forward_re(
+                out["a_t"], out["a_v"], out["a_g"],
+                pairs, out["boxes"])
+            return s_kv, s_vk
